@@ -18,14 +18,12 @@ from pprint import pformat
 
 import torch
 
+from lerobot.datasets.lerobot_dataset import (LeRobotDataset,
+                                                     LeRobotDatasetMetadata,
+                                                     MultiLeRobotDataset)
+from lerobot.datasets.transforms import ImageTransforms
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.train import TrainPipelineConfig
-from lerobot.datasets.lerobot_dataset import (
-    LeRobotDataset,
-    LeRobotDatasetMetadata,
-    MultiLeRobotDataset,
-)
-from lerobot.datasets.transforms import ImageTransforms
 
 IMAGENET_STATS = {
     "mean": [[[0.485]], [[0.456]], [[0.406]]],  # (c,1,1)
@@ -49,7 +47,7 @@ def resolve_delta_timestamps(
                 "observation.state": [-0.04, -0.02, 0]
                 "observation.action": [-0.02, 0, 0.02]
             }
-            returns `None` if the resulting dict is empty.
+            returns `None` if the the resulting dict is empty.
     """
     delta_timestamps = {}
     for key in ds_meta.features:
@@ -58,7 +56,9 @@ def resolve_delta_timestamps(
         if key == "action" and cfg.action_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
         if key.startswith("observation.") and cfg.observation_delta_indices is not None:
-            delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
+            delta_timestamps[key] = [
+                i / ds_meta.fps for i in cfg.observation_delta_indices
+            ]
 
     if len(delta_timestamps) == 0:
         delta_timestamps = None
@@ -79,13 +79,55 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         LeRobotDataset | MultiLeRobotDataset
     """
     image_transforms = (
-        ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
+        ImageTransforms(cfg.dataset.image_transforms)
+        if cfg.dataset.image_transforms.enable
+        else None
     )
 
     if isinstance(cfg.dataset.repo_id, str):
         ds_meta = LeRobotDatasetMetadata(
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
+
+        import jax
+        import numpy as np
+        from rich.pretty import pprint
+
+        stats = ds_meta.stats
+        jointstat = stats["observation.state.joints"]
+        gripperstat = stats["observation.state.gripper"]
+        actionstat = jax.tree.map(
+            lambda *_x: np.concatenate(_x), jointstat, gripperstat
+        )
+        actionstat["count"] = jointstat["count"]
+        ds_meta.stats["action"] = actionstat
+        ds_meta.stats["observation.state"] = actionstat
+
+        ft = ds_meta.features
+        joint = ft["observation.state.joints"]
+        gripper = ft["observation.state.gripper"]
+        action = {
+            "dtype": "float32",
+            "shape": actionstat["mean"].shape,
+            "names": joint["names"] + gripper["names"],
+        }
+        ds_meta.features["action"] = action
+        ds_meta.features["observation.state"] = action
+
+        for thing in [ds_meta.stats, ds_meta.features]:
+            for k in [
+                "observation.state.joints",
+                "observation.state.gripper",
+                "observation.state.position",
+                "observation.image.side",
+            ]:
+                if k in thing:
+                    del thing[k]
+
+        pprint(ds_meta)
+        pprint(ds_meta.features)
+        pprint(ds_meta.stats)
+
         delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
         dataset = LeRobotDataset(
             cfg.dataset.repo_id,
@@ -96,6 +138,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             revision=cfg.dataset.revision,
             video_backend=cfg.dataset.video_backend,
         )
+        dataset.meta = ds_meta
     else:
         raise NotImplementedError("The MultiLeRobotDataset isn't supported for now.")
         dataset = MultiLeRobotDataset(
@@ -113,6 +156,8 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
     if cfg.dataset.use_imagenet_stats:
         for key in dataset.meta.camera_keys:
             for stats_type, stats in IMAGENET_STATS.items():
-                dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+                dataset.meta.stats[key][stats_type] = torch.tensor(
+                    stats, dtype=torch.float32
+                )
 
     return dataset

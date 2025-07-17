@@ -77,6 +77,21 @@ CODEBASE_VERSION = "v2.1"
 
 
 class LeRobotDatasetMetadata:
+    def __init__(self, hf_dataset):
+        self.hf_dataset = hf_dataset
+        valid_keys = [
+            'observation.image.low',
+            'observation.image.side',
+            'observation.image.wrist',
+            'observation.state.gripper',
+            'observation.state.joints',
+            'observation.state.position',
+            'timestamp',
+            'episode_index',
+            'frame_index',
+            'lang',
+        ]
+        self.qkeys = [k for k in self.hf_dataset.column_names if k in valid_keys]
     def __init__(
         self,
         repo_id: str,

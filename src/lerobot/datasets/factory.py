@@ -1,20 +1,11 @@
 #!/usr/bin/env python
+# Copyright 2024 The HuggingFace Inc.
+# Licensed under the Apache License, Version 2.0
 
-# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 import logging
 from pprint import pformat
+import os
+import numpy as np
 
 import torch
 
@@ -29,27 +20,15 @@ from lerobot.datasets.transforms import ImageTransforms
 
 IMAGENET_STATS = {
     "mean": [[[0.485]], [[0.456]], [[0.406]]],  # (c,1,1)
-    "std": [[[0.229]], [[0.224]], [[0.225]]],  # (c,1,1)
+    "std": [[[0.229]], [[0.224]], [[0.225]]],   # (c,1,1)
 }
 
 
 def resolve_delta_timestamps(
     cfg: PreTrainedConfig, ds_meta: LeRobotDatasetMetadata
 ) -> dict[str, list] | None:
-    """Resolves delta_timestamps by reading from the 'delta_indices' properties of the PreTrainedConfig.
-
-    Args:
-        cfg (PreTrainedConfig): The PreTrainedConfig to read delta_indices from.
-        ds_meta (LeRobotDatasetMetadata): The dataset from which features and fps are used to build
-            delta_timestamps against.
-
-    Returns:
-        dict[str, list] | None: A dictionary of delta_timestamps, e.g.:
-            {
-                "observation.state": [-0.04, -0.02, 0]
-                "observation.action": [-0.02, 0, 0.02]
-            }
-            returns `None` if the resulting dict is empty.
+    """
+    Build delta_timestamps from the config's *_delta_indices and the dataset fps.
     """
     delta_timestamps = {}
     for key in ds_meta.features:
@@ -60,32 +39,94 @@ def resolve_delta_timestamps(
         if key.startswith("observation.") and cfg.observation_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
 
-    if len(delta_timestamps) == 0:
-        delta_timestamps = None
+    return delta_timestamps or None
 
-    return delta_timestamps
+
+def _concat_stats(jointstat: dict, gripperstat: dict) -> dict:
+    """
+    Concatenate per-key stats dictionaries (mean/std/min/max) along the last axis.
+    Assumes arrays, not torch tensors.
+    """
+    out = {}
+    for k in ("mean", "std", "min", "max"):
+        if k in jointstat and k in gripperstat:
+            a = np.asarray(jointstat[k])
+            b = np.asarray(gripperstat[k])
+            # make sure gripper stat shapes broadcast (e.g., (8,) vs (1,))
+            if b.ndim < a.ndim:
+                # expand dims until ranks match, then broadcast
+                while b.ndim < a.ndim:
+                    b = np.expand_dims(b, axis=0)
+                b = np.broadcast_to(b, a.shape[:-1] + b.shape[-1:])
+            out[k] = np.concatenate([a, b], axis=-1)
+    # carry count (use joints count)
+    if "count" in jointstat:
+        out["count"] = jointstat["count"]
+    return out
 
 
 def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDataset:
-    """Handles the logic of setting up delta timestamps and image transforms before creating a dataset.
+    # Log where this function is coming from to ensure the right factory is used
+    logging.warning(
+        f"⚠️ make_dataset loaded from: {__file__}"
+    )
 
-    Args:
-        cfg (TrainPipelineConfig): A TrainPipelineConfig config which contains a DatasetConfig and a PreTrainedConfig.
-
-    Raises:
-        NotImplementedError: The MultiLeRobotDataset is currently deactivated.
-
-    Returns:
-        LeRobotDataset | MultiLeRobotDataset
-    """
     image_transforms = (
-        ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
+        ImageTransforms(cfg.dataset.image_transforms)
+        if cfg.dataset.image_transforms.enable
+        else None
     )
 
     if isinstance(cfg.dataset.repo_id, str):
+        # ----- Build/edit metadata -----
         ds_meta = LeRobotDatasetMetadata(
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
+
+        # We require these source keys
+        required = ["observation.state.joints", "observation.state.gripper"]
+        missing = [k for k in required if k not in ds_meta.features]
+        if missing:
+            raise KeyError(
+                f"Dataset is missing required keys for action/state merge: {missing}. "
+                f"Available keys: {list(ds_meta.features.keys())}"
+            )
+
+        # Create merged stats for both `action` and `observation.state` = concat(joints(7), gripper(1)) -> (8,)
+        jointstat = ds_meta.stats["observation.state.joints"]
+        gripperstat = ds_meta.stats["observation.state.gripper"]
+        merged_stat = _concat_stats(jointstat, gripperstat)  # (8,)
+
+        ds_meta.stats["action"] = merged_stat
+        ds_meta.stats["observation.state"] = merged_stat
+
+        # Create features for both keys
+        ft = ds_meta.features
+        joint_ft = ft["observation.state.joints"]
+        gripper_ft = ft["observation.state.gripper"]
+
+        merged_names = (joint_ft.get("names") or []) + (gripper_ft.get("names") or [])
+
+        merged_feature = {
+            "dtype": "float32",
+            "shape": list(merged_stat["mean"].shape),  # e.g., [8]
+            "names": merged_names,
+        }
+        ds_meta.features["action"] = merged_feature
+        ds_meta.features["observation.state"] = merged_feature
+
+        # optional: prune the raw component fields to simplify model inputs
+        for thing in (ds_meta.stats, ds_meta.features):
+            for k in [
+                "observation.state.joints",
+                "observation.state.gripper",
+                "observation.state.position",
+                "observation.image.side",  # drop if you don't want this camera
+            ]:
+                if k in thing:
+                    del thing[k]
+
+        # ----- Create dataset -----
         delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
         dataset = LeRobotDataset(
             cfg.dataset.repo_id,
@@ -96,23 +137,50 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             revision=cfg.dataset.revision,
             video_backend=cfg.dataset.video_backend,
         )
-    else:
-        raise NotImplementedError("The MultiLeRobotDataset isn't supported for now.")
-        dataset = MultiLeRobotDataset(
-            cfg.dataset.repo_id,
-            # TODO(aliberts): add proper support for multi dataset
-            # delta_timestamps=delta_timestamps,
-            image_transforms=image_transforms,
-            video_backend=cfg.dataset.video_backend,
-        )
-        logging.info(
-            "Multiple datasets were provided. Applied the following index mapping to the provided datasets: "
-            f"{pformat(dataset.repo_id_to_index, indent=2)}"
+
+        # Inject both columns (`action` and `observation.state`) into the HF dataset table
+        def add_action_and_state(batch):
+            # joints: (B,7), gripper: (B,) or (B,1)
+            joints = np.asarray(batch["observation.state.joints"])
+            gripper = np.asarray(batch["observation.state.gripper"])
+            if gripper.ndim == 1:
+                gripper = gripper[:, None]
+            merged = np.concatenate([joints, gripper], axis=-1)  # (B,8)
+            return {"action": merged, "observation.state": merged}
+
+        dataset.hf_dataset = dataset.hf_dataset.map(add_action_and_state, batched=True)
+
+        # Point dataset.meta to our edited metadata (with merged features/stats)
+        dataset.meta = ds_meta
+
+        # Debug prints
+        logging.warning(
+            "✅ make_dataset added 'action' (7 joints + 1 gripper) "
+            "and 'observation.state' (same 8-D). Features now: %s",
+            list(dataset.meta.features.keys()),
         )
 
+    else:
+        # Multi dataset (currently deactivated)
+        raise NotImplementedError("The MultiLeRobotDataset isn't supported for now.")
+        # If you ever re-enable:
+        # dataset = MultiLeRobotDataset(
+        #     cfg.dataset.repo_id,
+        #     image_transforms=image_transforms,
+        #     video_backend=cfg.dataset.video_backend,
+        # )
+        # logging.info(
+        #     "Multiple datasets were provided. Applied the following index mapping to the provided datasets: "
+        #     f"{pformat(dataset.repo_id_to_index, indent=2)}"
+        # )
+
+    # Optional: apply ImageNet stats for vision keys
     if cfg.dataset.use_imagenet_stats:
         for key in dataset.meta.camera_keys:
             for stats_type, stats in IMAGENET_STATS.items():
-                dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+                dataset.meta.stats[key][stats_type] = torch.tensor(
+                    stats, dtype=torch.float32
+                )
 
     return dataset
+

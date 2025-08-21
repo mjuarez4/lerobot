@@ -728,6 +728,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # Add task as a string
         task_idx = item["task_index"].item()
         item["task"] = self.meta.tasks[task_idx]
+        if "action" not in item:
+            joints = item["observation.state.joints"]
+            gripper = item["observation.state.gripper"]
+            # Ensure both are 1D tensors
+            action_vec = torch.cat([joints.view(-1), gripper.view(-1)], dim=0)
+            item["action"] = action_vec
 
         return item
 

@@ -27,6 +27,8 @@ from torch.optim import Optimizer
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
+import inspect
+print("⚠️ make_dataset loaded from:", inspect.getfile(make_dataset))
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import cycle
 from lerobot.envs.factory import make_env
@@ -126,7 +128,17 @@ def train(cfg: TrainPipelineConfig):
 
     logging.info("Creating dataset")
     dataset = make_dataset(cfg)
+    print("Available feature keys:\n", dataset.meta.features.keys())
+    print("HF dataset columns:", dataset.hf_dataset.column_names)
 
+    # Hard sanity check
+    assert "action" in dataset.meta.features, "meta.features missing 'action'"
+    assert "action" in dataset.hf_dataset.column_names, "hf_dataset missing 'action' column"
+
+    # Optional: check a sample’s shapes
+    sample0 = dataset[0]
+    print("sample[\"action\"].shape =", tuple(sample0["action"].shape))
+    #print("sample[\"observation.state\"].shape =", tuple(sample0["observation.state"].shape))
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     # using the eval.py instead, with gym_dora environment and dora-rs.
@@ -140,7 +152,6 @@ def train(cfg: TrainPipelineConfig):
         cfg=cfg.policy,
         ds_meta=dataset.meta,
     )
-
     logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
     grad_scaler = GradScaler(device.type, enabled=cfg.policy.use_amp)
